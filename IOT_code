@@ -1,0 +1,717 @@
+#include <Wire.h>
+#include <Servo.h>
+#include <math.h>
+#include <EEPROM.h>
+
+// ===== SYSTEM CONSTANTS =====
+#define CONTROL_FREQ_HZ 50
+#define SENSOR_FREQ_HZ 75
+#define CONTROL_PERIOD_MS (1000/CONTROL_FREQ_HZ)
+#define SENSOR_PERIOD_MS (1000/SENSOR_FREQ_HZ)
+
+// ===== PIN DEFINITIONS =====
+const uint8_t TOP_SERVO_PIN = 3;
+const uint8_t BOTTOM_SERVO_PIN = 5;
+const uint8_t LEFT_SERVO_PIN = 6;
+const uint8_t RIGHT_SERVO_PIN = 9;
+const uint8_t MOTOR_PWM_PIN = 10;
+const uint8_t ARMED_LED_PIN = 7;
+const uint8_t DETECTION_LED_PIN = 8;
+const uint8_t SAFETY_SWITCH_PIN = 2;
+const uint8_t OVERRIDE_SWITCH_PIN = 4;
+const uint8_t BUZZER_PIN = 12;
+
+// ===== MAGNETOMETER CONSTANTS =====
+const uint8_t HMC5883L_ADDR = 0x1E;
+const uint8_t HMC5883L_CONFIG_A = 0x00;
+const uint8_t HMC5883L_CONFIG_B = 0x01;
+const uint8_t HMC5883L_MODE = 0x02;
+const uint8_t HMC5883L_DATA = 0x03;
+const float MAG_SCALE_FACTOR = 0.92e-6;
+
+// ===== CONTROL PARAMETERS =====
+const uint8_t SERVO_CENTER = 90;
+const uint8_t SERVO_MIN = 30;
+const uint8_t SERVO_MAX = 150;
+const uint8_t MAX_DEFLECTION = 45;
+
+// ===== DETECTION PARAMETERS =====
+const float DETECTION_THRESHOLD = 8.0;
+const float DERIVATIVE_THRESHOLD = 12.0;
+const float NOISE_THRESHOLD = 0.5;
+const uint8_t MOVING_AVG_WINDOW = 8;
+
+// ===== TIMING VARIABLES (FIXED) =====
+unsigned long lastControlTime = 0;
+unsigned long lastSensorTime = 0;
+unsigned long systemStartTime = 0;
+
+// ===== SYSTEM STRUCTURES =====
+typedef struct {
+    bool armed;
+    bool targetLocked;
+    bool manualOverride;
+    bool systemError;
+    uint8_t errorCode;
+    float systemUptime;
+} SystemStatus;
+
+typedef struct {
+    float x, y, z;
+    float filteredX, filteredY, filteredZ;
+    float magnitude;
+    float bearing;
+    float elevation;
+    float distance;
+    float signalStrength;
+    float noiseLevel;
+} MagneticData;
+
+typedef struct {
+    int16_t top, bottom, left, right;
+    float yawCommand, pitchCommand;
+    float yawError, pitchError;
+    uint32_t updateCount;
+} ControlData;
+
+typedef struct {
+    float loopTime;
+    float sensorTime;
+    float detectionRate;
+    uint32_t totalCycles;
+    uint32_t detectionCount;
+    float avgResponseTime;
+} PerformanceMetrics;
+
+// ===== GLOBAL OBJECTS =====
+Servo topServo, bottomServo, leftServo, rightServo;
+
+// ===== GLOBAL VARIABLES =====
+SystemStatus status = {false, false, false, false, 0, 0.0};
+MagneticData magnetic = {0};
+ControlData control = {90, 90, 90, 90, 0, 0, 0, 0, 0};
+PerformanceMetrics performance = {0};
+
+// ===== KALMAN FILTER VARIABLES =====
+float kalmanX[3] = {0, 0, 0};
+float kalmanY[3] = {0, 0, 0};
+float kalmanZ[3] = {0, 0, 0};
+float kalmanP[3][3] = {{1,0,0},{0,1,0},{0,0,1}};
+const float kalmanQ = 0.01;
+const float kalmanR = 0.1;
+
+// ===== FILTERING BUFFERS =====
+float xBuffer[MOVING_AVG_WINDOW];
+float yBuffer[MOVING_AVG_WINDOW];
+float zBuffer[MOVING_AVG_WINDOW];
+uint8_t bufferIndex = 0;
+
+// ===== CALIBRATION DATA =====
+float baselineX = 0, baselineY = 0, baselineZ = 0;
+bool calibrationComplete = false;
+
+// ===== SETUP FUNCTION =====
+void setup() {
+    Serial.begin(115200);
+    Serial.println(F("========================================"));
+    Serial.println(F("TORPEDO GUIDANCE SYSTEM - FIXED"));
+    Serial.println(F("B.Tech Final Year Project"));
+    Serial.println(F("Real-Time Magnetic Proximity Guidance"));
+    Serial.println(F("========================================"));
+
+    // Configure pins
+    pinMode(ARMED_LED_PIN, OUTPUT);
+    pinMode(DETECTION_LED_PIN, OUTPUT);
+    pinMode(BUZZER_PIN, OUTPUT);
+    pinMode(SAFETY_SWITCH_PIN, INPUT_PULLUP);
+    pinMode(OVERRIDE_SWITCH_PIN, INPUT_PULLUP);
+    pinMode(MOTOR_PWM_PIN, OUTPUT);
+
+    // Initialize outputs
+    digitalWrite(ARMED_LED_PIN, LOW);
+    digitalWrite(DETECTION_LED_PIN, LOW);
+    analogWrite(MOTOR_PWM_PIN, 0);
+
+    // Attach servos
+    topServo.attach(TOP_SERVO_PIN, 1000, 2000);
+    bottomServo.attach(BOTTOM_SERVO_PIN, 1000, 2000);
+    leftServo.attach(LEFT_SERVO_PIN, 1000, 2000);
+    rightServo.attach(RIGHT_SERVO_PIN, 1000, 2000);
+
+    centerAllServos();
+    Serial.println(F("Servo initialization complete"));
+
+    // Initialize I2C
+    Wire.begin();
+    Wire.setClock(400000L);
+
+    // Initialize magnetometer
+    if (initMagnetometer()) {
+        Serial.println(F("Magnetometer: READY"));
+    } else {
+        Serial.println(F("ERROR: Magnetometer failed!"));
+        status.systemError = true;
+        status.errorCode = 1;
+        signalError(3);
+    }
+
+    // Calibration
+    performAdvancedCalibration();
+    initKalmanFilter();
+    initCircularBuffers();
+
+    // Setup interrupts (external only - no timer conflicts)
+    attachInterrupt(digitalPinToInterrupt(SAFETY_SWITCH_PIN), safetyInterrupt, FALLING);
+
+    // Initialize timing
+    systemStartTime = millis();
+    lastControlTime = systemStartTime;
+    lastSensorTime = systemStartTime;
+    performance.totalCycles = 0;
+    performance.detectionCount = 0;
+
+    Serial.println(F("System initialization complete"));
+    Serial.println(F("Control: 50Hz | Sensors: 75Hz"));
+    Serial.println(F("Ready for operation"));
+    Serial.println(F("========================================"));
+
+    delay(1000);
+    signalReady();
+}
+
+// ===== MAIN LOOP (FIXED TIMING) =====
+void loop() {
+    static unsigned long lastPrintTime = 0;
+    unsigned long currentTime = millis();
+    unsigned long loopStartTime = micros();
+
+    // SENSOR PROCESSING (75Hz)
+    if (currentTime - lastSensorTime >= SENSOR_PERIOD_MS) {
+        lastSensorTime = currentTime;
+        unsigned long sensorStart = micros();
+
+        if (readMagnetometerFast()) {
+            applyKalmanFilter();
+            updateMovingAverage();
+            calculateMagneticParameters();
+            performance.sensorTime = (micros() - sensorStart) / 1000.0;
+        } else {
+            status.systemError = true;
+            status.errorCode = 2;
+        }
+    }
+
+    // CONTROL PROCESSING (50Hz)
+    if ((currentTime - lastControlTime >= CONTROL_PERIOD_MS) && !status.systemError) {
+        lastControlTime = currentTime;
+        unsigned long controlStart = micros();
+
+        updateSystemStatus();
+        bool targetDetected = advancedTargetDetection();
+
+        if (status.armed && !status.manualOverride) {
+            if (targetDetected) {
+                status.targetLocked = true;
+                digitalWrite(DETECTION_LED_PIN, HIGH);
+                calculateOptimalControl();
+                executeServoControlSmooth();
+                updatePropulsionControl();
+                performance.detectionCount++;
+            } else {
+                status.targetLocked = false;
+                digitalWrite(DETECTION_LED_PIN, LOW);
+                executeSearchPattern();
+            }
+        }
+
+        control.updateCount++;
+        performance.totalCycles++;
+        performance.loopTime = (micros() - controlStart) / 1000.0;
+
+        if (performance.totalCycles > 0) {
+            performance.detectionRate = (float)performance.detectionCount / performance.totalCycles * 100.0;
+        }
+    }
+
+    // COMMUNICATION (5Hz)
+    if (currentTime - lastPrintTime >= 200) {
+        printRealTimeData();
+        lastPrintTime = currentTime;
+    }
+
+    // ERROR HANDLING
+    if (status.systemError) {
+        handleSystemError();
+    }
+
+    // Loop timing check
+    unsigned long loopTime = micros() - loopStartTime;
+    if (loopTime > 1000) {
+        Serial.print(F("WARNING: Loop time: "));
+        Serial.print(loopTime);
+        Serial.println(F("µs"));
+    }
+
+    delayMicroseconds(100);
+}
+
+// ===== INTERRUPT HANDLER =====
+void safetyInterrupt() {
+    static unsigned long lastInterruptTime = 0;
+    unsigned long interruptTime = millis();
+
+    if (interruptTime - lastInterruptTime > 200) {
+        if (!status.armed && (millis() - systemStartTime) > 3000) {
+            status.armed = true;
+            digitalWrite(ARMED_LED_PIN, HIGH);
+            signalArmed();
+        } else if (status.armed) {
+            emergencyDisarm();
+        }
+    }
+    lastInterruptTime = interruptTime;
+}
+
+// ===== MAGNETOMETER FUNCTIONS =====
+bool initMagnetometer() {
+    Wire.beginTransmission(HMC5883L_ADDR);
+    if (Wire.endTransmission() != 0) return false;
+
+    Wire.beginTransmission(HMC5883L_ADDR);
+    Wire.write(HMC5883L_CONFIG_A);
+    Wire.write(0x78);
+    Wire.endTransmission();
+
+    Wire.beginTransmission(HMC5883L_ADDR);
+    Wire.write(HMC5883L_CONFIG_B);
+    Wire.write(0x20);
+    Wire.endTransmission();
+
+    Wire.beginTransmission(HMC5883L_ADDR);
+    Wire.write(HMC5883L_MODE);
+    Wire.write(0x00);
+    Wire.endTransmission();
+
+    delay(67);
+    return true;
+}
+
+bool readMagnetometerFast() {
+    Wire.beginTransmission(HMC5883L_ADDR);
+    Wire.write(HMC5883L_DATA);
+    if (Wire.endTransmission() != 0) return false;
+
+    Wire.requestFrom((uint8_t)HMC5883L_ADDR, (uint8_t)6);
+
+    unsigned long timeout = micros() + 1000;
+    while (Wire.available() < 6 && micros() < timeout);
+
+    if (Wire.available() >= 6) {
+        int16_t rawX = (Wire.read() << 8) | Wire.read();
+        int16_t rawZ = (Wire.read() << 8) | Wire.read();
+        int16_t rawY = (Wire.read() << 8) | Wire.read();
+
+        magnetic.x = rawX * MAG_SCALE_FACTOR;
+        magnetic.y = rawY * MAG_SCALE_FACTOR;
+        magnetic.z = rawZ * MAG_SCALE_FACTOR;
+
+        return true;
+    }
+    return false;
+}
+
+// ===== FILTERING FUNCTIONS =====
+void initKalmanFilter() {
+    for (int i = 0; i < 3; i++) {
+        kalmanX[i] = 0;
+        kalmanY[i] = 0;
+        kalmanZ[i] = 0;
+        for (int j = 0; j < 3; j++) {
+            kalmanP[i][j] = (i == j) ? 1.0 : 0.0;
+        }
+    }
+}
+
+void applyKalmanFilter() {
+    kalmanX[0] = kalmanX[0] + kalmanX[1] * 0.0133;
+    kalmanX[1] = kalmanX[1] + kalmanX[2] * 0.0133;
+    float innovationX = (magnetic.x - baselineX) - kalmanX[0];
+    kalmanX[0] = kalmanX[0] + innovationX * 0.1;
+
+    kalmanY[0] = kalmanY[0] + kalmanY[1] * 0.0133;
+    kalmanY[1] = kalmanY[1] + kalmanY[2] * 0.0133;
+    float innovationY = (magnetic.y - baselineY) - kalmanY[0];
+    kalmanY[0] = kalmanY[0] + innovationY * 0.1;
+
+    kalmanZ[0] = kalmanZ[0] + kalmanZ[1] * 0.0133;
+    kalmanZ[1] = kalmanZ[1] + kalmanZ[2] * 0.0133;
+    float innovationZ = (magnetic.z - baselineZ) - kalmanZ[0];
+    kalmanZ[0] = kalmanZ[0] + innovationZ * 0.1;
+
+    magnetic.filteredX = kalmanX[0];
+    magnetic.filteredY = kalmanY[0];
+    magnetic.filteredZ = kalmanZ[0];
+}
+
+void updateMovingAverage() {
+    xBuffer[bufferIndex] = magnetic.filteredX;
+    yBuffer[bufferIndex] = magnetic.filteredY;
+    zBuffer[bufferIndex] = magnetic.filteredZ;
+
+    bufferIndex = (bufferIndex + 1) % MOVING_AVG_WINDOW;
+
+    float sumX = 0, sumY = 0, sumZ = 0;
+    for (int i = 0; i < MOVING_AVG_WINDOW; i++) {
+        sumX += xBuffer[i];
+        sumY += yBuffer[i];
+        sumZ += zBuffer[i];
+    }
+
+    magnetic.filteredX = sumX / MOVING_AVG_WINDOW;
+    magnetic.filteredY = sumY / MOVING_AVG_WINDOW;
+    magnetic.filteredZ = sumZ / MOVING_AVG_WINDOW;
+}
+
+// ===== TARGET DETECTION =====
+bool advancedTargetDetection() {
+    magnetic.magnitude = sqrt(magnetic.filteredX * magnetic.filteredX + 
+                             magnetic.filteredY * magnetic.filteredY + 
+                             magnetic.filteredZ * magnetic.filteredZ);
+
+    magnetic.signalStrength = magnetic.magnitude * 1e6;
+
+    bool magnitudeDetection = magnetic.signalStrength > DETECTION_THRESHOLD;
+
+    static float previousMagnitude = 0;
+    float changeRate = abs(magnetic.magnitude - previousMagnitude) * SENSOR_FREQ_HZ * 1e6;
+    bool rateDetection = changeRate > DERIVATIVE_THRESHOLD;
+    previousMagnitude = magnetic.magnitude;
+
+    float snr = magnetic.signalStrength / magnetic.noiseLevel;
+    bool snrDetection = snr > 3.0;
+
+    return (magnitudeDetection && snrDetection) || rateDetection;
+}
+
+// ===== CONTROL FUNCTIONS =====
+void calculateOptimalControl() {
+    magnetic.bearing = atan2(magnetic.filteredY, magnetic.filteredX) * 180.0 / PI;
+    if (magnetic.bearing < 0) magnetic.bearing += 360.0;
+
+    float horizontalMag = sqrt(magnetic.filteredX * magnetic.filteredX + 
+                              magnetic.filteredY * magnetic.filteredY);
+    magnetic.elevation = atan2(magnetic.filteredZ, horizontalMag) * 180.0 / PI;
+
+    magnetic.distance = 1000.0 / (magnetic.signalStrength + 1.0);
+
+    float adaptiveGain = 1.0 + (magnetic.signalStrength / 50.0);
+
+    float bearingError = magnetic.bearing;
+    if (bearingError > 180) bearingError -= 360;
+
+    control.yawError = bearingError;
+    control.pitchError = magnetic.elevation;
+
+    control.yawCommand = -control.yawError * adaptiveGain * 0.5;
+    control.pitchCommand = -control.pitchError * adaptiveGain * 0.5;
+
+    control.yawCommand = constrain(control.yawCommand, -MAX_DEFLECTION, MAX_DEFLECTION);
+    control.pitchCommand = constrain(control.pitchCommand, -MAX_DEFLECTION, MAX_DEFLECTION);
+}
+
+void executeServoControlSmooth() {
+    int16_t leftTarget = SERVO_CENTER + (int16_t)control.yawCommand;
+    int16_t rightTarget = SERVO_CENTER - (int16_t)control.yawCommand;
+    int16_t topTarget = SERVO_CENTER + (int16_t)control.pitchCommand;
+    int16_t bottomTarget = SERVO_CENTER - (int16_t)control.pitchCommand;
+
+    leftTarget = constrain(leftTarget, SERVO_MIN, SERVO_MAX);
+    rightTarget = constrain(rightTarget, SERVO_MIN, SERVO_MAX);
+    topTarget = constrain(topTarget, SERVO_MIN, SERVO_MAX);
+    bottomTarget = constrain(bottomTarget, SERVO_MIN, SERVO_MAX);
+
+    control.left = (control.left * 3 + leftTarget) / 4;
+    control.right = (control.right * 3 + rightTarget) / 4;
+    control.top = (control.top * 3 + topTarget) / 4;
+    control.bottom = (control.bottom * 3 + bottomTarget) / 4;
+
+    leftServo.write(control.left);
+    rightServo.write(control.right);
+    topServo.write(control.top);
+    bottomServo.write(control.bottom);
+}
+
+// ===== UTILITY FUNCTIONS =====
+void performAdvancedCalibration() {
+    Serial.println(F("Calibrating magnetic baseline..."));
+    Serial.println(F("Keep stationary for 5 seconds"));
+
+    float sumX = 0, sumY = 0, sumZ = 0;
+    float sumX2 = 0, sumY2 = 0, sumZ2 = 0;
+    const int samples = 200;
+
+    for (int i = 0; i < samples; i++) {
+        if (readMagnetometerFast()) {
+            sumX += magnetic.x;
+            sumY += magnetic.y;
+            sumZ += magnetic.z;
+            sumX2 += magnetic.x * magnetic.x;
+            sumY2 += magnetic.y * magnetic.y;
+            sumZ2 += magnetic.z * magnetic.z;
+        }
+
+        if (i % 40 == 0) Serial.print(F("."));
+        delay(25);
+    }
+    Serial.println();
+
+    baselineX = sumX / samples;
+    baselineY = sumY / samples;
+    baselineZ = sumZ / samples;
+
+    float varX = (sumX2 / samples) - (baselineX * baselineX);
+    float varY = (sumY2 / samples) - (baselineY * baselineY);
+    float varZ = (sumZ2 / samples) - (baselineZ * baselineZ);
+
+    magnetic.noiseLevel = sqrt((varX + varY + varZ) / 3.0) * 1e6;
+
+    Serial.print(F("Baseline: X="));
+    Serial.print(baselineX * 1e6, 2);
+    Serial.print(F("µT Y="));
+    Serial.print(baselineY * 1e6, 2);
+    Serial.print(F("µT Z="));
+    Serial.print(baselineZ * 1e6, 2);
+    Serial.println(F("µT"));
+
+    Serial.print(F("Noise: "));
+    Serial.print(magnetic.noiseLevel, 2);
+    Serial.println(F("µT RMS"));
+
+    calibrationComplete = true;
+}
+
+void initCircularBuffers() {
+    for (int i = 0; i < MOVING_AVG_WINDOW; i++) {
+        xBuffer[i] = 0;
+        yBuffer[i] = 0;
+        zBuffer[i] = 0;
+    }
+    bufferIndex = 0;
+}
+
+void centerAllServos() {
+    control.left = SERVO_CENTER;
+    control.right = SERVO_CENTER;
+    control.top = SERVO_CENTER;
+    control.bottom = SERVO_CENTER;
+
+    leftServo.write(SERVO_CENTER);
+    rightServo.write(SERVO_CENTER);
+    topServo.write(SERVO_CENTER);
+    bottomServo.write(SERVO_CENTER);
+
+    delay(1000);
+}
+
+void executeSearchPattern() {
+    static unsigned long searchStartTime = 0;
+    static uint8_t searchPhase = 0;
+
+    if (searchStartTime == 0) searchStartTime = millis();
+
+    unsigned long searchTime = millis() - searchStartTime;
+
+    switch (searchPhase) {
+        case 0:
+            control.yawCommand = -15;
+            control.pitchCommand = 0;
+            if (searchTime > 2000) {
+                searchPhase = 1;
+                searchStartTime = millis();
+            }
+            break;
+        case 1:
+            control.yawCommand = 15;
+            control.pitchCommand = 0;
+            if (searchTime > 4000) {
+                searchPhase = 2;
+                searchStartTime = millis();
+            }
+            break;
+        case 2:
+            control.yawCommand = 0;
+            control.pitchCommand = 0;
+            if (searchTime > 1000) {
+                searchPhase = 0;
+                searchStartTime = 0;
+            }
+            break;
+    }
+
+    executeServoControlSmooth();
+}
+
+void updateSystemStatus() {
+    status.systemUptime = (millis() - systemStartTime) / 1000.0;
+    status.manualOverride = !digitalRead(OVERRIDE_SWITCH_PIN);
+
+    if (performance.loopTime > 25.0) {
+        status.systemError = true;
+        status.errorCode = 10;
+    }
+
+    if (magnetic.noiseLevel > 50.0) {
+        status.systemError = true;
+        status.errorCode = 11;
+    }
+}
+
+void updatePropulsionControl() {
+    if (status.targetLocked) {
+        float thrustLevel = 200;
+
+        if (magnetic.distance < 100) {
+            thrustLevel = 150;
+        }
+
+        float totalError = abs(control.yawError) + abs(control.pitchError);
+        if (totalError > 30) {
+            thrustLevel = 100;
+        }
+
+        analogWrite(MOTOR_PWM_PIN, (int)thrustLevel);
+    } else {
+        analogWrite(MOTOR_PWM_PIN, 120);
+    }
+}
+
+void printRealTimeData() {
+    Serial.print(F("STAT: T="));
+    Serial.print(status.systemUptime, 1);
+    Serial.print(F("s ARM="));
+    Serial.print(status.armed ? F("Y") : F("N"));
+    Serial.print(F(" TGT="));
+    Serial.print(status.targetLocked ? F("LOCK") : F("SRCH"));
+    Serial.print(F(" ERR="));
+    Serial.println(status.errorCode);
+
+    Serial.print(F("MAG: X="));
+    Serial.print(magnetic.filteredX * 1e6, 2);
+    Serial.print(F(" Y="));
+    Serial.print(magnetic.filteredY * 1e6, 2);
+    Serial.print(F(" Z="));
+    Serial.print(magnetic.filteredZ * 1e6, 2);
+    Serial.print(F(" |M|="));
+    Serial.print(magnetic.signalStrength, 2);
+    Serial.print(F("µT"));
+
+    if (status.targetLocked) {
+        Serial.print(F(" BEAR="));
+        Serial.print(magnetic.bearing, 1);
+        Serial.print(F("° ELEV="));
+        Serial.print(magnetic.elevation, 1);
+        Serial.print(F("° DIST="));
+        Serial.print(magnetic.distance, 0);
+        Serial.print(F("m"));
+    }
+    Serial.println();
+
+    Serial.print(F("CTRL: YAW="));
+    Serial.print(control.yawCommand, 1);
+    Serial.print(F(" PITCH="));
+    Serial.print(control.pitchCommand, 1);
+    Serial.print(F(" SERVOS: L="));
+    Serial.print(control.left);
+    Serial.print(F(" R="));
+    Serial.print(control.right);
+    Serial.print(F(" T="));
+    Serial.print(control.top);
+    Serial.print(F(" B="));
+    Serial.println(control.bottom);
+
+    Serial.print(F("PERF: LOOP="));
+    Serial.print(performance.loopTime, 2);
+    Serial.print(F("ms SENS="));
+    Serial.print(performance.sensorTime, 2);
+    Serial.print(F("ms DET_RATE="));
+    Serial.print(performance.detectionRate, 1);
+    Serial.print(F("% CYCLES="));
+    Serial.println(performance.totalCycles);
+
+    Serial.println(F("---"));
+}
+
+void handleSystemError() {
+    Serial.print(F("SYSTEM ERROR: Code "));
+    Serial.println(status.errorCode);
+
+    analogWrite(MOTOR_PWM_PIN, 0);
+    centerAllServos();
+
+    for (int i = 0; i < status.errorCode; i++) {
+        digitalWrite(ARMED_LED_PIN, HIGH);
+        digitalWrite(DETECTION_LED_PIN, HIGH);
+        delay(200);
+        digitalWrite(ARMED_LED_PIN, LOW);
+        digitalWrite(DETECTION_LED_PIN, LOW);
+        delay(200);
+    }
+
+    delay(2000);
+
+    if (status.errorCode < 5) {
+        status.systemError = false;
+        status.errorCode = 0;
+        Serial.println(F("Attempting recovery..."));
+    }
+}
+
+void emergencyDisarm() {
+    status.armed = false;
+    status.targetLocked = false;
+    digitalWrite(ARMED_LED_PIN, LOW);
+    digitalWrite(DETECTION_LED_PIN, LOW);
+    analogWrite(MOTOR_PWM_PIN, 0);
+    centerAllServos();
+
+    for (int i = 0; i < 3; i++) {
+        digitalWrite(BUZZER_PIN, HIGH);
+        delay(100);
+        digitalWrite(BUZZER_PIN, LOW);
+        delay(100);
+    }
+
+    Serial.println(F("*** EMERGENCY DISARM ***"));
+}
+
+void signalReady() {
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(200);
+    digitalWrite(BUZZER_PIN, LOW);
+}
+
+void signalArmed() {
+    for (int i = 0; i < 2; i++) {
+        digitalWrite(BUZZER_PIN, HIGH);
+        delay(150);
+        digitalWrite(BUZZER_PIN, LOW);
+        delay(150);
+    }
+}
+
+void signalError(int beeps) {
+    for (int i = 0; i < beeps; i++) {
+        digitalWrite(BUZZER_PIN, HIGH);
+        delay(500);
+        digitalWrite(BUZZER_PIN, LOW);
+        delay(300);
+    }
+}
+
+void calculateMagneticParameters() {
+    // Placeholder for additional magnetic analysis
+}
+// This is a near-complete IOT implementation (arduino UNO) code. Furthermore, improvements like real-life magnetic parameters must be taken into account.
+
+
+

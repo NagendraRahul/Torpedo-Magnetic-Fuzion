@@ -1,0 +1,352 @@
+# Magnetic Proximity Fuze Simulation for Torpedoes
+
+A MATLAB simulation modeling a naval magnetic proximity fuze (magnetic pistol) mounted on a torpedo. The algorithm detects local magnetic field anomalies created by a ferromagnetic target (surface vessel or submarine) interacting with Earth's geomagnetic field and determines the optimal firing threshold [8].
+
+---
+
+## Overview & Physics
+
+The proximity fuze detects perturbations in the ambient geomagnetic field vector. Ferromagnetic ship hulls act as large magnetic dipoles, generating an anomalous field that decays rapidly with distance [8]:
+
+
+### Detection Mechanism
+1. **DC Baseline Stripping**: Removes Earth's background geomagnetic field ($B_{\text{earth}} \approx 50\,\mu\text{T}$) [8].
+2. **Bandpass Filtering**: A 3rd-order Butterworth low-pass filter suppresses sensor and ambient acoustic/hydrodynamic noise [8].
+3. **Dual Detection Logic**: Evaluates both signal magnitude and instantaneous rate of change ($dB/dt$) against pre-set firing thresholds [8].
+4. **Safety Interlock**: Disarms detonation logic until a minimum safety delay and separation travel requirement are satisfied [8].
+
+---
+
+## MATLAB Implementation
+
+%% MAGNETIC PROXIMITY FUZE SIMULATION FOR TORPEDO
+% This simulation models a magnetic proximity fuze system mounted on a torpedo
+% that detects and detonates when approaching a ferromagnetic target (ship/submarine)
+% Based on the operating principles of magnetic pistols used in naval weapons systems.
+
+clear all;
+close all;
+clc;
+
+%% SIMULATION PARAMETERS
+fprintf('==================================================\n');
+fprintf('MAGNETIC PROXIMITY FUZE SIMULATION\n');
+fprintf('==================================================\n\n');
+
+% Time parameters
+dt = 0.01;                    % Time step (seconds)
+t_total = 35;                 % Total simulation time (seconds)
+time = 0:dt:t_total;          % Time vector
+N = length(time);             % Number of samples
+
+% Earth's magnetic field parameters
+B_earth = 50e-6;              % Earth's magnetic field strength (Tesla)
+B_earth_variation = 0.01e-6;  % Natural variation in Earth's field
+
+% Torpedo parameters
+torpedo_speed = 25;           % Torpedo speed (m/s)
+torpedo_depth = 10;           % Torpedo depth (meters)
+initial_distance = 600;       % Initial distance to target (meters)
+
+% Target ship parameters
+ship_length = 150;            % Ship length (meters)
+ship_beam = 20;               % Ship beam (meters)
+ship_magnetic_moment = 500000; % Ship's magnetic moment (A/m²)
+ship_speed = 5;               % Ship speed (m/s)
+ship_course = 180;            % Ship course (degrees) - heading towards torpedo
+
+% Magnetic sensor parameters
+sensor_sensitivity = 0.001e-6; % Magnetometer sensitivity (Tesla)
+sensor_noise_std = 0.001e-6;   % Sensor noise standard deviation
+detection_threshold = 0.01e-6; % Magnetic field detection threshold
+sensor_range = 250;            % Maximum detection range (meters)
+
+% Signal processing parameters
+amplification_gain = 100000;  % Signal amplification factor
+filter_cutoff = 2.0;          % Low-pass filter cutoff frequency (Hz)
+integration_time = 0.2;       % Signal integration time (seconds)
+
+% Safety parameters
+arming_distance = 150;        % Minimum arming distance (meters)
+safety_delay = 3.0;           % Safety arming delay (seconds)
+
+% Derivative detection parameters
+derivative_threshold = 0.005e-6; % Rate of change threshold
+derivative_gain = 50000;      % Derivative signal gain
+
+%% INITIALIZE VARIABLES
+torpedo_position = zeros(N, 2);   % [x, y] positions
+ship_position = zeros(N, 2);      % [x, y] positions
+distance_to_target = zeros(N, 1);
+magnetic_field_raw = zeros(N, 1);
+ship_magnetic_field = zeros(N, 1);
+sensor_output = zeros(N, 1);
+amplified_signal = zeros(N, 1);
+filtered_signal = zeros(N, 1);
+detection_signal = zeros(N, 1);
+derivative_signal = zeros(N, 1);
+combined_signal = zeros(N, 1);
+firing_signal = zeros(N, 1);
+system_armed = false(N, 1);
+
+% Initial positions (collision course)
+torpedo_position(1, :) =;[0]
+ship_position(1, :) = [initial_distance, 20];
+
+%% DESIGN SIGNAL PROCESSING FILTERS
+fs = 1/dt;  % Sampling frequency
+[b_lpf, a_lpf] = butter(3, filter_cutoff/(fs/2), 'low');
+
+%% MAIN SIMULATION LOOP
+fprintf('Starting simulation...\n');
+fprintf('Torpedo approaching target...\n\n');
+
+simulation_ended = false;
+final_index = N;
+
+for i = 2:N
+    current_time = time(i);
+    
+    % Update kinematics
+    torpedo_position(i, 1) = torpedo_position(i-1, 1) + torpedo_speed * dt;
+    torpedo_position(i, 2) = torpedo_position(i-1, 2);
+    
+    ship_position(i, 1) = ship_position(i-1, 1) - ship_speed * cos(deg2rad(ship_course)) * dt;
+    ship_position(i, 2) = ship_position(i-1, 2) + ship_speed * sin(deg2rad(ship_course)) * dt;
+    
+    distance_to_target(i) = norm(torpedo_position(i, :) - ship_position(i, :));
+    
+    %% MAGNETIC FIELD CALCULATION
+    B_background = B_earth + B_earth_variation * sin(current_time) * (rand - 0.5);
+    
+    B_ship = 0;
+    r_vec = torpedo_position(i, :) - ship_position(i, :);
+    r_mag = norm(r_vec);
+    
+    if r_mag > 1 && r_mag <= sensor_range
+        mu_0 = 4*pi*1e-7;
+        B_ship = (mu_0 * ship_magnetic_moment) / (4*pi * r_mag^3);
+        
+        % Proximity factor
+        if r_mag < 200
+            proximity_factor = 5 * exp(-(r_mag-5)/40);
+            B_ship = B_ship * (1 + proximity_factor);
+        end
+        
+        % Directional factor
+        if r_mag > 0
+            r_unit = r_vec / r_mag;
+            angle_factor = abs(cos(atan2(r_unit(2), r_unit(1))));
+            B_ship = B_ship * (0.3 + 2.0 * angle_factor);
+        end
+        
+        % Ship dimension scale factor
+        size_factor = 1 + (ship_length / 80);
+        B_ship = B_ship * size_factor;
+        
+        % Magnetic wake factor
+        if torpedo_position(i, 1) > ship_position(i, 1) && r_mag < 100
+            wake_factor = 1.5 * exp(-(r_mag-10)/25);
+            B_ship = B_ship * (1 + wake_factor);
+        end
+    end
+    
+    ship_magnetic_field(i) = B_ship;
+    magnetic_field_raw(i) = B_background + B_ship;
+    
+    %% SENSOR MODELING
+    sensor_noise = sensor_noise_std * randn;
+    sensor_output(i) = magnetic_field_raw(i) + sensor_noise;
+    
+    % Sensor saturation check
+    sensor_max = 1000e-6;
+    if abs(sensor_output(i)) > sensor_max
+        sensor_output(i) = sign(sensor_output(i)) * sensor_max;
+    end
+    
+    %% SIGNAL PROCESSING PIPELINE
+    % 1. High-pass filtering (DC removal)
+    if i > 10
+        dc_component = mean(sensor_output(max(1, i-9):i));
+        sensor_ac = sensor_output(i) - dc_component;
+    else
+        sensor_ac = sensor_output(i) - B_earth;
+    end
+    
+    % 2. Amplification
+    amplified_signal(i) = sensor_ac * amplification_gain;
+    
+    % 3. Low-pass noise filtering
+    if i > 10
+        start_idx = max(1, i-9);
+        temp_signal = amplified_signal(start_idx:i);
+        if length(temp_signal) >= 3
+            temp_filtered = filter(b_lpf, a_lpf, temp_signal);
+            filtered_signal(i) = temp_filtered(end);
+        else
+            filtered_signal(i) = amplified_signal(i);
+        end
+    else
+        filtered_signal(i) = amplified_signal(i);
+    end
+    
+    % 4. Integration
+    signal_magnitude = abs(filtered_signal(i));
+    integration_samples = round(integration_time / dt);
+    if i > integration_samples
+        integrated_signal = mean(abs(filtered_signal(i-integration_samples+1:i)));
+    else
+        integrated_signal = signal_magnitude;
+    end
+    detection_signal(i) = integrated_signal;
+    
+    % 5. Derivative evaluation (dB/dt)
+    if i > 5
+        field_derivative = (ship_magnetic_field(i) - ship_magnetic_field(i-5)) / (5*dt);
+        derivative_signal(i) = abs(field_derivative) * derivative_gain;
+    else
+        derivative_signal(i) = 0;
+    end
+    
+    combined_signal(i) = max(detection_signal(i), derivative_signal(i) * 0.5);
+    
+    %% SAFETY AND ARMING LOGIC
+    if current_time > safety_delay && distance_to_target(i) < (initial_distance - arming_distance)
+        system_armed(i) = true;
+    end
+    
+    %% FIRING DECISION LOGIC
+    firing_signal(i) = 0;
+    if system_armed(i)
+        threshold_value = detection_threshold * amplification_gain;
+        derivative_threshold_value = derivative_threshold * derivative_gain;
+        
+        magnitude_detection = detection_signal(i) > threshold_value;
+        derivative_detection = derivative_signal(i) > derivative_threshold_value;
+        detection_triggered = magnitude_detection || derivative_detection;
+        
+        if detection_triggered
+            if distance_to_target(i) < 120
+                firing_signal(i) = 1;
+                fprintf('*** DETONATION TRIGGERED ***\n');
+                fprintf('Time: %.2f seconds\n', current_time);
+                fprintf('Distance to target: %.1f meters\n', distance_to_target(i));
+                fprintf('Total magnetic field: %.2e Tesla\n', magnetic_field_raw(i));
+                fprintf('Ship magnetic contribution: %.2e Tesla\n', B_ship);
+                fprintf('Detection signal: %.2e (threshold: %.2e)\n', detection_signal(i), threshold_value);
+                fprintf('Derivative signal: %.2e (threshold: %.2e)\n', derivative_signal(i), derivative_threshold_value);
+                
+                simulation_ended = true;
+                final_index = i;
+                break;
+            end
+        end
+    end
+    
+    % Miss check
+    if i > 100 && distance_to_target(i) > distance_to_target(i-1) && distance_to_target(i-1) < 50
+        fprintf('Torpedo passed target without detonation at: %.1f m\n', min(distance_to_target(1:i)));
+        final_index = i;
+        break;
+    end
+end
+
+%% POST-SIMULATION TRIMMING & PLOTS
+time_actual = time(1:final_index);
+create_enhanced_simulation_plots(time_actual, torpedo_position(1:final_index, :), ...
+    ship_position(1:final_index, :), distance_to_target(1:final_index), ...
+    magnetic_field_raw(1:final_index), ship_magnetic_field(1:final_index), ...
+    sensor_output(1:final_index), filtered_signal(1:final_index), ...
+    detection_signal(1:final_index), derivative_signal(1:final_index), ...
+    combined_signal(1:final_index), firing_signal(1:final_index), ...
+    system_armed(1:final_index), B_earth, detection_threshold, ...
+    derivative_threshold, amplification_gain, derivative_gain);
+
+%% VISUALIZATION FUNCTION
+function create_enhanced_simulation_plots(time, torpedo_pos, ship_pos, distance, ...
+    mag_field_raw, ship_mag_field, sensor_output, filtered_signal, detection_signal, ...
+    derivative_signal, combined_signal, firing_signal, system_armed, B_earth, ...
+    threshold, derivative_threshold, gain, derivative_gain)
+
+    figure('Name', 'Enhanced Magnetic Proximity Fuze Simulation Results', 'Position', [1400]);[50][900]
+
+    % Trajectory
+    subplot(2, 4, 1);
+    plot(torpedo_pos(:, 1), torpedo_pos(:, 2), 'b-', 'LineWidth', 2); hold on;
+    plot(ship_pos(:, 1), ship_pos(:, 2), 'r-', 'LineWidth', 2);
+    plot(torpedo_pos(1, 1), torpedo_pos(1, 2), 'bo', 'MarkerFaceColor', 'b');
+    plot(ship_pos(1, 1), ship_pos(1, 2), 'ro', 'MarkerFaceColor', 'r');
+    if any(firing_signal)
+        det_idx = find(firing_signal, 1);
+        plot(torpedo_pos(det_idx, 1), torpedo_pos(det_idx, 2), 'r*', 'MarkerSize', 12, 'LineWidth', 2);
+    end
+    xlabel('X Position (m)'); ylabel('Y Position (m)');
+    title('Trajectories'); legend('Torpedo', 'Ship', 'Start (T)', 'Start (S)', 'Detonation', 'Location', 'best');
+    grid on;
+
+    % Distance vs Time
+    subplot(2, 4, 2);
+    plot(time, distance, 'k-', 'LineWidth', 1.5); hold on;
+    if any(firing_signal)
+        det_idx = find(firing_signal, 1);
+        plot(time(det_idx), distance(det_idx), 'r*', 'MarkerSize', 10, 'LineWidth', 2);
+    end
+    xlabel('Time (s)'); ylabel('Distance (m)');
+    title('Distance to Target'); grid on;
+
+    % Magnetic Field Signals
+    subplot(2, 4, 3);
+    plot(time, (mag_field_raw - B_earth)*1e6, 'b-'); hold on;
+    plot(time, ship_mag_field*1e6, 'g-', 'LineWidth', 1.5);
+    plot(time, (sensor_output - B_earth)*1e6, 'r--');
+    xlabel('Time (s)'); ylabel('Field (\muT)');
+    title('Magnetic Signatures'); legend('Raw Deviation', 'Ship Anomaly', 'Sensor Output', 'Location', 'best');
+    grid on;
+
+    % Detection Signals & Thresholds
+    subplot(2, 4, 4);
+    plot(time, detection_signal*1e6, 'm-'); hold on;
+    plot(time, derivative_signal*1e6, 'c-');
+    plot(time, combined_signal*1e6, 'k-', 'LineWidth', 1.5);
+    yline(threshold * gain * 1e6, 'r--', 'Mag Threshold');
+    yline(derivative_threshold * derivative_gain * 1e6, 'g--', 'Der Threshold');
+    xlabel('Time (s)'); ylabel('Signal (\muT)');
+    title('Detection Signals'); grid on;
+
+    % System Armed & Firing State
+    subplot(2, 4, 5);
+    plot(time, double(system_armed), 'b-', 'LineWidth', 1.5); hold on;
+    if any(firing_signal)
+        fire_indices = find(firing_signal);
+        plot(time(fire_indices), firing_signal(fire_indices), 'ro', 'MarkerFaceColor', 'r');
+    end
+    xlabel('Time (s)'); ylabel('State (Binary)');
+    title('Arming & Detonation'); ylim([-0.1, 1.1]); grid on;
+
+    % Signal vs Distance
+    subplot(2, 4, 6);
+    plot(distance, ship_mag_field*1e6, 'g-'); hold on;
+    plot(distance, detection_signal*1e6, 'm-');
+    plot(distance, derivative_signal*1e6, 'c-');
+    xlabel('Distance (m)'); ylabel('Signal (\muT)');
+    title('Signal vs Distance'); grid on;
+
+    % Processing Chain
+    subplot(2, 4, 7);
+    plot(time, filtered_signal*1e6, 'g-'); hold on;
+    plot(time, detection_signal*1e6, 'm-');
+    xlabel('Time (s)'); ylabel('Signal (\muT)');
+    title('Filtered vs Integrated'); legend('LPF Output', 'Integrated', 'Location', 'best');
+    grid on;
+
+    % Effectiveness Ratio
+    subplot(2, 4, 8);
+    plot(time, detection_signal ./ (threshold * gain), 'm-'); hold on;
+    plot(time, derivative_signal ./ (derivative_threshold * derivative_gain), 'c-');
+    yline(1.0, 'r--', 'Threshold Level');
+    xlabel('Time (s)'); ylabel('Ratio');
+    title('Detection Ratios'); ylim(); grid on;[0][2]
+end
+
+---
+

@@ -1,0 +1,379 @@
+# Autonomous Magnetic Proximity Fuze Simulation for Naval Torpedo Systems
+
+
+An end-to-end MATLAB simulation framework modeling the kinematics, geomagnetic field distortion, sensor dynamics, DSP filtering pipeline, and safety/detonation logic of a naval torpedo magnetic pistol.
+
+## 1. Mathematical & Physical Principles
+A moving ferromagnetic vessel (surface ship or submarine) perturbs the ambient geomagnetic background field. The torpedo's on-board magnetometer samples this dynamic vector perturbation.
+
+### Anomaly Field Formulation
+
+The ship's induced and permanent magnetization is modeled as a modified magnetic dipole with boundary-layer proximity, aspect angle, vessel scale, and turbulent wake corrections.
+
+### Derivative Gradient Estimation
+
+To capture the transition during close approach or under-keel passage, the instantaneous magnetic gradient is approximated by a 5-sample backward difference 
+---
+
+
+
+
+## 2. Complete MATLAB Source Code
+
+function torpedo_magnetic_fuze_simulation()
+%% MAGNETIC PROXIMITY FUZE SIMULATION FOR TORPEDO
+% Models an autonomous magnetic pistol evaluating multi-stage DSP filters and derivative-based triggers to actuate an underwater warhead.
+
+clear all; 
+close all; 
+clc;
+
+%% 1. SIMULATION SETUP & CONSTANTS
+fprintf('==================================================\n');
+fprintf('   NAVAL TORPEDO MAGNETIC PROXIMITY FUZE SIM      \n');
+fprintf('==================================================\n\n');
+
+dt = 0.01;                     % Sampling period (s) -> 100 Hz
+t_total = 35;                  % Maximum simulation duration (s)
+time = 0:dt:t_total;           % Time discretization vector
+N = length(time);              % Sample length
+
+% Environmental geomagnetic parameters
+B_earth = 50e-6;               % Ambient geomagnetic baseline (T)
+B_earth_variation = 0.01e-6;   % Diurnal/localized perturbation magnitude (T)
+
+% Torpedo kinematic parameters
+torpedo_speed = 25;            % Speed (m/s) ≈ 48.6 knots
+torpedo_depth = 10;            % Operating depth (m)
+initial_distance = 600;        % Initial stand-off range (m)
+
+% Target vessel parameters
+ship_length = 150;             % Length overall (m)
+ship_beam = 20;                % Beam width (m)
+ship_magnetic_moment = 500000;  % Dipole moment (A*m^2)
+ship_speed = 5;                % Target velocity (m/s) ≈ 9.7 knots
+ship_course = 180;             % Head-on intercept trajectory (deg)
+
+% Magnetometer sensor characteristics
+sensor_sensitivity = 0.001e-6; % Quantization floor (T)
+sensor_noise_std = 0.001e-6;   % Gaussian noise sigma (T)
+sensor_max = 1000e-6;          % Front-end saturation limit (T)
+sensor_range = 250;            % Detection horizon (m)
+
+% DSP pipeline coefficients
+amplification_gain = 100000;   % Pre-amp gain (V/V or numerical)
+filter_cutoff = 2.0;           % Anti-aliasing LPF corner frequency (Hz)
+integration_time = 0.2;        % Moving-average integrator length (s)
+derivative_gain = 50000;       % Gradient signal scaling
+
+% Safety & threshold limits
+arming_distance = 150;         % Safe travel distance before arming (m)
+safety_delay = 3.0;            % Minimum post-launch timer lock (s)
+detection_threshold = 0.01e-6; % Magnitude trigger threshold (T)
+derivative_threshold = 0.005e-6; % Rate-of-change trigger threshold (T/s)
+
+%% 2. MEMORY PREALLOCATION
+torpedo_position    = zeros(N, 2);
+ship_position       = zeros(N, 2);
+distance_to_target  = zeros(N, 1);
+magnetic_field_raw  = zeros(N, 1);
+ship_magnetic_field = zeros(N, 1);
+sensor_output       = zeros(N, 1);
+amplified_signal    = zeros(N, 1);
+filtered_signal     = zeros(N, 1);
+detection_signal    = zeros(N, 1);
+derivative_signal   = zeros(N, 1);
+combined_signal     = zeros(N, 1);
+firing_signal       = zeros(N, 1);
+system_armed        = false(N, 1);
+
+% Initial kinematic coordinates [X, Y] in meters
+torpedo_position(1, :) =;[0]
+ship_position(1, :)    = [initial_distance, 20];
+
+%% 3. FILTER SYNTHESIS
+fs = 1 / dt;  % 100 Hz sampling rate
+[b_lpf, a_lpf] = butter(3, filter_cutoff / (fs / 2), 'low');
+
+%% 4. DISCRETE-TIME SIMULATION LOOP
+fprintf('Launching torpedo simulation...\n');
+simulation_ended = false;
+final_index = N;
+
+for i = 2:N
+    current_time = time(i);
+    
+    % Update Kinematics
+    torpedo_position(i, 1) = torpedo_position(i-1, 1) + torpedo_speed * dt;
+    torpedo_position(i, 2) = torpedo_position(i-1, 2);
+    
+    ship_position(i, 1) = ship_position(i-1, 1) - ship_speed * cos(deg2rad(ship_course)) * dt;
+    ship_position(i, 2) = ship_position(i-1, 2) + ship_speed * sin(deg2rad(ship_course)) * dt;
+    
+    r_vec = torpedo_position(i, :) - ship_position(i, :);
+    r_mag = norm(r_vec);
+    distance_to_target(i) = r_mag;
+    
+    % Magnetic Field Physics Calculation
+    B_background = B_earth + B_earth_variation * sin(current_time) * (rand - 0.5);
+    B_ship = 0;
+    
+    if r_mag > 1 && r_mag <= sensor_range
+        mu_0 = 4 * pi * 1e-7;
+        B_ship = (mu_0 * ship_magnetic_moment) / (4 * pi * r_mag^3);
+        
+        % Proximity enhancement
+        if r_mag < 200
+            proximity_factor = 5 * exp(-(r_mag - 5) / 40);
+            B_ship = B_ship * (1 + proximity_factor);
+        end
+        
+        % Directional factor
+        if r_mag > 0
+            r_unit = r_vec / r_mag;
+            angle_factor = abs(cos(atan2(r_unit(2), r_unit(1))));
+            B_ship = B_ship * (0.3 + 2.0 * angle_factor);
+        end
+        
+        % Ship scale factor
+        B_ship = B_ship * (1 + (ship_length / 80));
+        
+        % Hydrodynamic magnetic wake disturbance
+        if torpedo_position(i, 1) > ship_position(i, 1) && r_mag < 100
+            wake_factor = 1.5 * exp(-(r_mag - 10) / 25);
+            B_ship = B_ship * (1 + wake_factor);
+        end
+    end
+    
+    ship_magnetic_field(i) = B_ship;
+    magnetic_field_raw(i)  = B_background + B_ship;
+    
+    % Sensor Noise and Front-End Saturation
+    sensor_noise = sensor_noise_std * randn;
+    s_val = magnetic_field_raw(i) + sensor_noise;
+    if abs(s_val) > sensor_max
+        s_val = sign(s_val) * sensor_max;
+    end
+    sensor_output(i) = s_val;
+    
+    % DSP Chain Step 1: DC Baseline Removal
+    if i > 10
+        dc_component = mean(sensor_output(max(1, i-9):i));
+        sensor_ac = sensor_output(i) - dc_component;
+    else
+        sensor_ac = sensor_output(i) - B_earth;
+    end
+    
+    % DSP Chain Step 2: Amplification
+    amplified_signal(i) = sensor_ac * amplification_gain;
+    
+    % DSP Chain Step 3: Low-Pass Filtering
+    if i > 10
+        start_idx = max(1, i-9);
+        temp_sig = amplified_signal(start_idx:i);
+        if length(temp_sig) >= 3
+            temp_filtered = filter(b_lpf, a_lpf, temp_sig);
+            filtered_signal(i) = temp_filtered(end);
+        else
+            filtered_signal(i) = amplified_signal(i);
+        end
+    else
+        filtered_signal(i) = amplified_signal(i);
+    end
+    
+    % DSP Chain Step 4: Time-Window Integration
+    integration_samples = round(integration_time / dt);
+    if i > integration_samples
+        detection_signal(i) = mean(abs(filtered_signal(i - integration_samples + 1:i)));
+    else
+        detection_signal(i) = abs(filtered_signal(i));
+    end
+    
+    % DSP Chain Step 5: Gradient / Derivative Extraction
+    if i > 5
+        field_derivative = (ship_magnetic_field(i) - ship_magnetic_field(i-5)) / (5 * dt);
+        derivative_signal(i) = abs(field_derivative) * derivative_gain;
+    else
+        derivative_signal(i) = 0;
+    end
+    
+    combined_signal(i) = max(detection_signal(i), derivative_signal(i) * 0.5);
+    
+    % Safety Interlock Evaluation
+    if (current_time > safety_delay) && (distance_to_target(i) < (initial_distance - arming_distance))
+        system_armed(i) = true;
+    end
+    
+    % Detonation Trigger Logic
+    firing_signal(i) = 0;
+    if system_armed(i)
+        th_mag_scaled = detection_threshold * amplification_gain;
+        th_der_scaled = derivative_threshold * derivative_gain;
+        
+        mag_trig = detection_signal(i) > th_mag_scaled;
+        der_trig = derivative_signal(i) > th_der_scaled;
+        
+        if (mag_trig || der_trig) && (distance_to_target(i) < 120)
+            firing_signal(i) = 1;
+            fprintf('\n>>> DETONATION SIGNAL TRIGGERED <<<\n');
+            fprintf('Timestamp:             %.2f s\n', current_time);
+            fprintf('Intercept Distance:    %.1f m\n', distance_to_target(i));
+            fprintf('Total B-Field:         %.2e T\n', magnetic_field_raw(i));
+            fprintf('Ship Anomaly:          %.2e T\n', B_ship);
+            fprintf('Detection Voltage:     %.2e (Thresh: %.2e)\n', detection_signal(i), th_mag_scaled);
+            fprintf('Derivative Signal:     %.2e (Thresh: %.2e)\n', derivative_signal(i), th_der_scaled);
+            
+            simulation_ended = true;
+            final_index = i;
+            break;
+        end
+    end
+    
+    % Periodic Console Log
+    if mod(i, round(N / 20)) == 0
+        fprintf('T = %4.1f s | Range = %5.1f m | Ship Anomaly = %.2e T | Det Signal = %.2e\n', ...
+            current_time, distance_to_target(i), B_ship, detection_signal(i));
+    end
+    
+    % Miss Distance Check
+    if (i > 100) && (distance_to_target(i) > distance_to_target(i-1)) && (distance_to_target(i-1) < 50)
+        fprintf('\nTarget passed without detonation. Closest point of approach: %.1f m\n', ...
+            min(distance_to_target(1:i)));
+        final_index = i;
+        break;
+    end
+end
+
+%% 5. DATA TRUNCATION & ANALYSIS
+idx = 1:final_index;
+t_act       = time(idx);
+torp_pos    = torpedo_position(idx, :);
+ship_pos    = ship_position(idx, :);
+dist_act    = distance_to_target(idx);
+raw_mag     = magnetic_field_raw(idx);
+ship_mag    = ship_magnetic_field(idx);
+sensor_out  = sensor_output(idx);
+filt_sig    = filtered_signal(idx);
+det_sig     = detection_signal(idx);
+der_sig     = derivative_signal(idx);
+comb_sig    = combined_signal(idx);
+fire_sig    = firing_signal(idx);
+armed_sig   = system_armed(idx);
+
+fprintf('\n==================================================\n');
+fprintf('                SIMULATION SUMMARY                \n');
+fprintf('==================================================\n');
+min_dist = min(dist_act(dist_act > 0));
+fprintf('Minimum Distance of Approach: %.2f m\n', min_dist);
+if any(fire_sig)
+    det_i = find(fire_sig, 1);
+    fprintf('Fuze Status:                   SUCCESSFUL DETONATION\n');
+    fprintf('Time of Detonation:            %.2f s\n', t_act(det_i));
+    fprintf('Detonation Stand-off:          %.2f m\n', dist_act(det_i));
+else
+    fprintf('Fuze Status:                   FAILED / MISSED\n');
+end
+fprintf('Peak Ship Induced Field:       %.2e T\n', max(ship_mag));
+fprintf('==================================================\n\n');
+
+%% 6. VISUALIZATION DASHBOARD
+render_telemetry_plots(t_act, torp_pos, ship_pos, dist_act, raw_mag, ship_mag, ...
+    sensor_out, filt_sig, det_sig, der_sig, comb_sig, fire_sig, armed_sig, ...
+    B_earth, detection_threshold, derivative_threshold, amplification_gain, derivative_gain);
+
+end
+
+%% 7. MULTI-PANEL TELEMETRY FUNCTION
+function render_telemetry_plots(t, torp_p, ship_p, dist, raw_b, ship_b, ...
+    sens_out, filt_s, det_s, der_s, comb_s, fire_s, armed_s, ...
+    B_e, th_mag, th_der, g_amp, g_der)
+
+figure('Name', 'Magnetic Proximity Fuze Diagnostics', 'Color', [1 1 1], 'Position', [1500]);[40][880]
+
+% 1. Kinematic Intercept
+subplot(2, 4, 1);
+plot(torp_p(:, 1), torp_p(:, 2), 'b-', 'LineWidth', 2); hold on;
+plot(ship_p(:, 1), ship_p(:, 2), 'r-', 'LineWidth', 2);
+plot(torp_p(1, 1), torp_p(1, 2), 'bo', 'MarkerFaceColor', 'b');
+plot(ship_p(1, 1), ship_p(1, 2), 'ro', 'MarkerFaceColor', 'r');
+if any(fire_s)
+    f_idx = find(fire_s, 1);
+    plot(torp_p(f_idx, 1), torp_p(f_idx, 2), 'p', 'MarkerSize', 14, ...
+        'MarkerEdgeColor', 'k', 'MarkerFaceColor', 'y');
+end
+xlabel('X Position (m)'); ylabel('Y Position (m)');
+title('Kinematic Trajectories'); legend('Torpedo', 'Target Ship', 'Location', 'best');
+grid on;
+
+% 2. Separation Range Profile
+subplot(2, 4, 2);
+plot(t, dist, 'k-', 'LineWidth', 1.5); hold on;
+if any(fire_s)
+    f_idx = find(fire_s, 1);
+    plot(t(f_idx), dist(f_idx), 'ro', 'MarkerSize', 8, 'MarkerFaceColor', 'r');
+end
+xlabel('Time (s)'); ylabel('Range (m)');
+title('Slant Range vs. Time'); grid on;
+
+% 3. Raw & Induced Field Signatures
+subplot(2, 4, 3);
+plot(t, (raw_b - B_e) * 1e6, 'b-'); hold on;
+plot(t, ship_b * 1e6, 'g-', 'LineWidth', 1.5);
+plot(t, (sens_out - B_e) * 1e6, 'r:');
+xlabel('Time (s)'); ylabel('Magnetic Flux (\muT)');
+title('Field Anomaly (\DeltaB)'); legend('True Total', 'Ship Target', 'Noisy Sensor', 'Location', 'best');
+grid on;
+
+% 4. Detection Signals & Firing Levels
+subplot(2, 4, 4);
+plot(t, det_s * 1e6, 'm-', 'LineWidth', 1.2); hold on;
+plot(t, der_s * 1e6, 'c-', 'LineWidth', 1.2);
+plot(t, comb_s * 1e6, 'k-', 'LineWidth', 1.5);
+yline(th_mag * g_amp * 1e6, 'r--', 'Mag Threshold');
+yline(th_der * g_der * 1e6, 'g--', 'Der Threshold');
+xlabel('Time (s)'); ylabel('Processed Signal (\muT)');
+title('Detection Signals & Limits'); legend('Integrated', 'Derivative', 'Combined', 'Location', 'best');
+grid on;
+
+% 5. Logic States (Arming & Firing)
+subplot(2, 4, 5);
+plot(t, double(armed_s), 'b-', 'LineWidth', 1.5); hold on;
+if any(fire_s)
+    fire_i = find(fire_s);
+    plot(t(fire_i), fire_s(fire_i), 'rs', 'MarkerSize', 8, 'MarkerFaceColor', 'r');
+end
+xlabel('Time (s)'); ylabel('Logic State');
+title('Arming & Firing Gate'); ylim([-0.2 1.2]);
+legend('System Armed', 'Detonation Trigger', 'Location', 'best');
+grid on;
+
+% 6. Signal Anomaly vs. Slant Range
+subplot(2, 4, 6);
+plot(dist, ship_b * 1e6, 'g-', 'LineWidth', 1.5); hold on;
+plot(dist, det_s * 1e6, 'm--');
+xlabel('Slant Range (m)'); ylabel('Signal Amplitude (\muT)');
+title('Signature vs. Separation'); legend('Ship Flux', 'Integrated Sig', 'Location', 'best');
+grid on;
+
+% 7. Filtered vs Integrated Output
+subplot(2, 4, 7);
+plot(t, filt_s * 1e6, 'Color', [0.3 0.7 0.3]); hold on;
+plot(t, det_s * 1e6, 'm-', 'LineWidth', 1.5);
+xlabel('Time (s)'); ylabel('Amplitude (\muT)');
+title('DSP Filter Output'); legend('Butterworth Out', 'Integrator Out', 'Location', 'best');
+grid on;
+
+% 8. Threshold Margin Ratio
+subplot(2, 4, 8);
+plot(t, det_s ./ (th_mag * g_amp), 'm-', 'LineWidth', 1.2); hold on;
+plot(t, der_s ./ (th_der * g_der), 'c-', 'LineWidth', 1.2);
+yline(1.0, 'r--', 'Detonation Trip Point');
+xlabel('Time (s)'); ylabel('Signal-to-Threshold Ratio');
+title('Detection Sensitivity Margin'); ylim([0 2.5]);
+legend('Mag Margin', 'Der Margin', 'Location', 'best');
+grid on;
+
+annotation('textbox', [0.28, 0.95, 0.45, 0.04], 'String', ...
+    'Autonomous Torpedo Magnetic Pistol Simulation Results', ...
+    'FontSize', 13, 'FontWeight', 'bold', 'HorizontalAlignment', 'center', 'FitBoxToText', 'on');
+end
